@@ -162,7 +162,7 @@ SALES_FIELD_CANDIDATES = {
     "colour": ["Item Color", "Item Colour"],
     "size": ["Ofp Size", "Size"],
     "dept": ["Ofp Dept Name"],
-    "subdepartment"],
+    "subdept": ["Ofp Sub Department"],
     "cls": ["Ofp Class Name"],
     "subclass": ["Ofp Sub Class Name"],
     "subbrand": ["Item Sub Brand"],
@@ -190,18 +190,6 @@ STOCK_FIELD_CANDIDATES = {
     "age_days_reported": ["Age Days", "Ageing Days", "Aging Days", "Days Since Last Sale",
                            "Stock Age Days", "Age In Days"],
 }
-
-
-def build_read_plan(columns, candidates, force_str_fields):
-    """Resolve mapping, then build usecols/dtype for a fast, column-limited read."""
-    mapping = resolve_mapping(columns, candidates)
-    usecols = [c for c in mapping.values() if c]
-    dtype = {}
-    for field in force_str_fields:
-        col = mapping.get(field)
-        if col:
-            dtype[col] = str
-    return mapping, usecols, dtype
 
 
 @st.cache_data(show_spinner=False)
