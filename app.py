@@ -1,11 +1,12 @@
 """
-Intra-Store Stock Consolidation Engine — OFP/BBZ Edition (Performance-tuned)
+Intra-Store Stock Consolidation Engine — OFP/BBZ Edition (Performance-tuned v2)
 Deploy on Streamlit Community Cloud: set this file (app.py) as the main file.
 Run locally:  streamlit run app.py
 """
 
 import io
 import time
+import warnings
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -15,12 +16,15 @@ from sklearn.cluster import KMeans, MiniBatchKMeans
 
 st.set_page_config(page_title="Intra-Store Stock Consolidation", layout="wide")
 
+warnings.filterwarnings("ignore", message=".*Could not infer format.*")
+
 # ----------------------------------------------------------------------------------
 # Generic helpers
 # ----------------------------------------------------------------------------------
 
 def normalize_header(name):
-    return str(name).strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+    s = str(name).replace("\ufeff", "")  # strip BOM if present
+    return s.strip().lower().replace(" ", "").replace("-", "").replace("_", "")
 
 
 def find_col(columns, target_names):
@@ -58,6 +62,39 @@ def to_numeric_clean(series):
     return pd.to_numeric(series.astype(str).str.strip(), errors="coerce")
 
 
+def parse_dates_fast(series, formats, dayfirst=False):
+    """Vectorized multi-format date parser. Tries each explicit format across the WHOLE
+    column at once (fast, C-level). Only genuine stragglers fall back to the slow
+    per-element dateutil parser — this avoids the 'Could not infer format' slowdown
+    that dominates runtime on large files."""
+    s = series.astype(str).str.strip()
+    s = s.mask(s.isin(["nan", "None", "NaT", ""]))
+
+    result = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    remaining_mask = s.notna()
+
+    for fmt in formats:
+        if not remaining_mask.any():
+            break
+        idx = s.index[remaining_mask]
+        candidates = s.loc[idx]
+        parsed = pd.to_datetime(candidates, format=fmt, errors="coerce")
+        good_mask = parsed.notna()
+        good_idx = idx[good_mask.values]
+        result.loc[good_idx] = parsed.loc[good_idx]
+        remaining_mask.loc[good_idx] = False
+
+    if remaining_mask.any():
+        idx = s.index[remaining_mask]
+        leftover = s.loc[idx]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parsed_fallback = pd.to_datetime(leftover, errors="coerce", dayfirst=dayfirst)
+        result.loc[idx] = parsed_fallback
+
+    return result
+
+
 class Timer:
     """Lightweight stage-by-stage profiler shown in the UI."""
     def __init__(self):
@@ -71,23 +108,35 @@ class Timer:
 
 
 # ----------------------------------------------------------------------------------
-# Fast, column-limited CSV / Excel reading
+# Fast CSV / Excel reading
 # ----------------------------------------------------------------------------------
 
-@st.cache_data(show_spinner=False)
 def read_csv_header(file_bytes):
+    """Tiny, uncached peek at just the header row — no point hashing a huge byte
+    blob for an operation this cheap."""
     return pd.read_csv(io.BytesIO(file_bytes), encoding="utf-8-sig", nrows=0).columns.tolist()
 
 
 @st.cache_data(show_spinner=False)
-def read_csv_full(file_bytes, usecols, dtype, parse_dates):
-    return pd.read_csv(
-        io.BytesIO(file_bytes), encoding="utf-8-sig",
-        usecols=usecols if usecols else None,
-        dtype=dtype if dtype else None,
-        parse_dates=parse_dates if parse_dates else None,
-        low_memory=False,
-    )
+def read_csv_full(file_bytes, usecols, dtype):
+    """Multi-threaded columnar read via pyarrow (fast at 1M+ rows), with a safe
+    fallback to the classic C engine (skipping malformed rows) if pyarrow can't
+    handle the file for any reason."""
+    try:
+        return pd.read_csv(
+            io.BytesIO(file_bytes),
+            usecols=usecols if usecols else None,
+            dtype=dtype if dtype else None,
+            engine="pyarrow",
+        )
+    except Exception:
+        return pd.read_csv(
+            io.BytesIO(file_bytes), encoding="utf-8-sig",
+            usecols=usecols if usecols else None,
+            dtype=dtype if dtype else None,
+            low_memory=False,
+            on_bad_lines="skip",
+        )
 
 
 @st.cache_data(show_spinner=False)
@@ -141,13 +190,6 @@ def build_location_map(loc_df):
     }
 
 
-def apply_consolidation(df, store_code_col, loc_maps):
-    df = df.copy()
-    df["raw_store_code"] = df[store_code_col].apply(normalize_code)
-    df["store_id"] = df["raw_store_code"].apply(lambda c: loc_maps["code_map"].get(c, c))
-    return df
-
-
 # ----------------------------------------------------------------------------------
 # Column mapping for Sales & Stock files
 # ----------------------------------------------------------------------------------
@@ -193,14 +235,16 @@ STOCK_FIELD_CANDIDATES = {
 
 
 @st.cache_data(show_spinner=False)
-def parse_sales(sales_bytes, mapping):
+def parse_sales(sales_bytes, mapping, loc_maps):
+    """Single pass: read (pyarrow), select/rename columns, clean numerics/dates,
+    AND resolve BBZ→OFP store_id — all in one cached step (one hash, one scan)."""
     m = mapping
     usecols = [c for c in m.values() if c]
     dtype = {}
     for field in ["store_code", "barcode"]:
         if m.get(field):
             dtype[m[field]] = str
-    raw = read_csv_full(sales_bytes, usecols, dtype, None)
+    raw = read_csv_full(sales_bytes, usecols, dtype)
 
     out = pd.DataFrame()
     for field in ["store_code", "country", "date", "barcode", "style", "colour", "size",
@@ -208,22 +252,27 @@ def parse_sales(sales_bytes, mapping):
         col = m.get(field)
         out[field] = raw[col] if col and col in raw.columns else np.nan
 
-    out["sales_qty"] = to_numeric_clean(out["sales_qty"]).fillna(0)
-    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["sales_qty"] = to_numeric_clean(out["sales_qty"]).fillna(0).astype("float32")
+    out["date"] = parse_dates_fast(
+        out["date"], formats=["%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%b-%y", "%d-%b-%Y"]
+    )
     out["barcode"] = out["barcode"].astype(str).str.strip()
-    out["raw_store_code"] = out["store_code"].apply(normalize_code)
+
+    raw_code = out["store_code"].apply(normalize_code)
+    out["store_id"] = raw_code.map(loc_maps["code_map"]).fillna(raw_code)
+    out["raw_store_code"] = raw_code
     return out
 
 
 @st.cache_data(show_spinner=False)
-def parse_stock(stock_bytes, mapping):
+def parse_stock(stock_bytes, mapping, loc_maps):
     m = mapping
     usecols = [c for c in m.values() if c]
     dtype = {}
     for field in ["store_code", "barcode"]:
         if m.get(field):
             dtype[m[field]] = str
-    raw = read_csv_full(stock_bytes, usecols, dtype, None)
+    raw = read_csv_full(stock_bytes, usecols, dtype)
 
     out = pd.DataFrame()
     for field in ["store_code", "country", "store_brand", "group", "division", "barcode", "style",
@@ -232,33 +281,36 @@ def parse_stock(stock_bytes, mapping):
         col = m.get(field)
         out[field] = raw[col] if col and col in raw.columns else np.nan
 
-    out["inv_qty"] = to_numeric_clean(out["inv_qty"]).fillna(0)
-    out["max_ageing"] = to_numeric_clean(out["max_ageing"])
-    out["age_days_reported"] = to_numeric_clean(out["age_days_reported"])
-    out["last_received"] = pd.to_datetime(out["last_received"], errors="coerce", dayfirst=True)
+    out["inv_qty"] = to_numeric_clean(out["inv_qty"]).fillna(0).astype("float32")
+    out["max_ageing"] = to_numeric_clean(out["max_ageing"]).astype("float32")
+    out["age_days_reported"] = to_numeric_clean(out["age_days_reported"]).astype("float32")
+    out["last_received"] = parse_dates_fast(
+        out["last_received"],
+        formats=["%d-%b-%y", "%d-%b-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"],
+        dayfirst=True,
+    )
     out["barcode"] = out["barcode"].astype(str).str.strip()
     out["colour"] = np.nan  # stock feed has no colour — backfilled later from sales
-    out["raw_store_code"] = out["store_code"].apply(normalize_code)
+
+    raw_code = out["store_code"].apply(normalize_code)
+    out["store_id"] = raw_code.map(loc_maps["code_map"]).fillna(raw_code)
+    out["raw_store_code"] = raw_code
     return out
 
 
 @st.cache_data(show_spinner=False)
-def apply_consolidation_fast(df, loc_maps):
-    df = df.copy()
-    code_map = loc_maps["code_map"]
-    df["store_id"] = df["raw_store_code"].map(code_map).fillna(df["raw_store_code"])
-    return df
-
-
-@st.cache_data(show_spinner=False)
 def build_barcode_attrs(sales_parsed):
-    """barcode -> best-known style/colour/size/dept hierarchy, learned from the sales feed.
-    Vectorized via groupby.first() on pre-sorted non-null values — no row-wise apply."""
+    """barcode -> best-known style/colour/size/dept hierarchy, learned from the sales
+    feed. Uses a temporary category dtype for the groupby key (the fastest option
+    at 1M-row scale), reverted to plain string on output."""
     attrs_cols = ["style", "colour", "size", "dept", "subdept", "cls", "subclass", "subbrand"]
     tmp = sales_parsed[["barcode"] + attrs_cols].copy()
     for c in attrs_cols:
         tmp[c] = tmp[c].replace("", np.nan)
-    attrs = tmp.sort_values("barcode").groupby("barcode", as_index=False)[attrs_cols].first()
+    tmp["barcode"] = tmp["barcode"].astype("category")
+
+    attrs = tmp.groupby("barcode", as_index=False, observed=True)[attrs_cols].first()
+    attrs["barcode"] = attrs["barcode"].astype(str)
     return attrs
 
 
@@ -279,7 +331,15 @@ def backfill_attrs(stock_parsed, barcode_attrs):
 
 @st.cache_data(show_spinner=False)
 def build_master(stock_parsed, sales_parsed, as_of_date):
-    stock_agg = stock_parsed.groupby(["store_id", "barcode"], as_index=False).agg(
+    # Temporarily cast the groupby keys to category for the two heaviest
+    # aggregations (these run over the full, un-aggregated row counts).
+    # observed=True prevents any combinatorial blow-up; both columns are cast
+    # straight back to plain strings immediately after, so nothing downstream
+    # ever sees category dtype.
+    stock_tmp = stock_parsed.copy()
+    stock_tmp["store_id"] = stock_tmp["store_id"].astype("category")
+    stock_tmp["barcode"] = stock_tmp["barcode"].astype("category")
+    stock_agg = stock_tmp.groupby(["store_id", "barcode"], as_index=False, observed=True).agg(
         inv_qty=("inv_qty", "sum"),
         style=("style", "first"), colour=("colour", "first"), size=("size", "first"),
         dept=("dept", "first"), subdept=("subdept", "first"),
@@ -288,6 +348,8 @@ def build_master(stock_parsed, sales_parsed, as_of_date):
         last_received=("last_received", "max"), max_ageing=("max_ageing", "max"),
         age_days_reported=("age_days_reported", "max"),
     )
+    stock_agg["store_id"] = stock_agg["store_id"].astype(str)
+    stock_agg["barcode"] = stock_agg["barcode"].astype(str)
 
     date_min, date_max = sales_parsed["date"].min(), sales_parsed["date"].max()
     if pd.notna(date_min) and pd.notna(date_max) and date_max > date_min:
@@ -295,13 +357,18 @@ def build_master(stock_parsed, sales_parsed, as_of_date):
     else:
         period_days = 30
 
-    sales_agg = sales_parsed.groupby(["store_id", "barcode"], as_index=False).agg(
+    sales_tmp = sales_parsed.copy()
+    sales_tmp["store_id"] = sales_tmp["store_id"].astype("category")
+    sales_tmp["barcode"] = sales_tmp["barcode"].astype("category")
+    sales_agg = sales_tmp.groupby(["store_id", "barcode"], as_index=False, observed=True).agg(
         sales_qty=("sales_qty", "sum"),
         style=("style", "first"), colour=("colour", "first"), size=("size", "first"),
         dept=("dept", "first"), subdept=("subdept", "first"),
         cls=("cls", "first"), subclass=("subclass", "first"), subbrand=("subbrand", "first"),
         country=("country", "first"),
     )
+    sales_agg["store_id"] = sales_agg["store_id"].astype(str)
+    sales_agg["barcode"] = sales_agg["barcode"].astype(str)
 
     master = pd.merge(stock_agg, sales_agg, on=["store_id", "barcode"], how="outer",
                        suffixes=("", "_sales"))
@@ -313,8 +380,7 @@ def build_master(stock_parsed, sales_parsed, as_of_date):
         master[col] = master[col].fillna("UNKNOWN")
 
     master["inv_qty"] = master["inv_qty"].fillna(0)
-    master["sales_qty"] = master["sales_qty"].fillna(0)
-    master["sales_period_days"] = period_days
+    master["sales_qty"] = master["sales_qty"].fillna(0)    master["sales_period_days"] = period_days
 
     computed_age = (pd.Timestamp(as_of_date) - master["last_received"]).dt.days
     master["ageing_days"] = master["age_days_reported"].where(
@@ -347,7 +413,6 @@ def compute_metrics(master, safety_woc, max_woc, dead_stock_days):
 
     df["aged_flag"] = (df["max_ageing"].notna()) & (df["ageing_days"] > df["max_ageing"])
 
-    # Hard rule: aged beyond threshold + zero sales at that location = force-release
     df["dead_stock_flag"] = (
         (df["ageing_days"] > dead_stock_days) &
         (df["velocity_per_week"] == 0) &
@@ -364,8 +429,6 @@ def compute_metrics(master, safety_woc, max_woc, dead_stock_days):
 
 @st.cache_data(show_spinner=False)
 def cluster_stores(df, n_clusters, top_n_styles=60):
-    # Cap the pivot to the top-N styles by total velocity; bucket the rest as OTHER
-    # to keep the KMeans feature matrix small even with thousands of SKUs.
     style_rank = df.groupby("style")["velocity_per_week"].sum().sort_values(ascending=False)
     top_styles = set(style_rank.head(top_n_styles).index)
     df = df.copy()
@@ -416,7 +479,6 @@ def compute_size_curve(df, qty_field="inv_qty"):
         (curve["present_size_count"] / curve["full_size_count"] * 100).round(1), np.nan,
     )
 
-    # Only compute the expensive "which sizes are missing" text for incomplete runs
     curve["missing_sizes"] = ""
     incomplete = curve[curve["present_size_count"] < curve["full_size_count"]]
     if not incomplete.empty:
@@ -436,7 +498,6 @@ def compute_size_curve(df, qty_field="inv_qty"):
 
 
 def flag_size_curve_priority(df, curve_before):
-    """Vectorized version — no per-row Python function calls."""
     lookup = curve_before[["store_id", "style", "colour", "present_size_count", "full_size_count"]]
     merged = df.merge(lookup, on=["store_id", "style", "colour"], how="left", suffixes=("", "_curve"))
 
@@ -459,7 +520,6 @@ def flag_size_curve_priority(df, curve_before):
 def run_transfer_engine(df, curve_before, horizon_weeks, allow_cross_cluster, min_transfer_qty):
     df = flag_size_curve_priority(df, curve_before)
 
-    # Integer-encode store/barcode once for fast dict keys instead of raw strings
     stores = pd.Index(df["store_id"].unique())
     barcodes = pd.Index(df["barcode"].unique())
     store_to_int = {s: i for i, s in enumerate(stores)}
@@ -479,8 +539,6 @@ def run_transfer_engine(df, curve_before, horizon_weeks, allow_cross_cluster, mi
         (r.store_int, r.barcode_int): r.excess_units for r in donors.itertuples()
     }
 
-    # Pre-group donors by (barcode, cluster) so each recipient only scans a tiny,
-    # relevant subset instead of every donor that ever carried that barcode.
     donors_sorted = donors.sort_values(
         ["dead_stock_flag", "aged_flag", "velocity_per_week", "ageing_days"],
         ascending=[False, False, True, False],
@@ -634,8 +692,7 @@ with st.sidebar:
     st.header("4. Performance Settings")
     top_n_styles = st.slider(
         "Max styles used for clustering features", 20, 200, 60, step=10,
-        help="Caps the clustering feature matrix width for very large assortments. "
-             "Lower = faster clustering, higher = more style-level nuance in clusters."
+        help="Caps the clustering feature matrix width for very large assortments."
     )
 
     st.divider()
@@ -677,11 +734,8 @@ if run_clicked:
     with st.spinner("Consolidating BBZ/OFP codes, computing velocity, dead-stock, clusters, size curves and transfer plan..."):
         loc_maps = timer.run("Build location map", build_location_map, loc_raw)
 
-        sales_parsed_raw = timer.run("Parse sales file", parse_sales, sales_bytes, sales_mapping)
-        stock_parsed_raw0 = timer.run("Parse stock file", parse_stock, stock_bytes, stock_mapping)
-
-        sales_parsed = timer.run("Consolidate BBZ→OFP (sales)", apply_consolidation_fast, sales_parsed_raw, loc_maps)
-        stock_parsed_raw = timer.run("Consolidate BBZ→OFP (stock)", apply_consolidation_fast, stock_parsed_raw0, loc_maps)
+        sales_parsed = timer.run("Parse + consolidate sales file", parse_sales, sales_bytes, sales_mapping, loc_maps)
+        stock_parsed_raw = timer.run("Parse + consolidate stock file", parse_stock, stock_bytes, stock_mapping, loc_maps)
 
         barcode_attrs = timer.run("Build barcode attribute lookup", build_barcode_attrs, sales_parsed)
         stock_parsed = timer.run("Backfill stock attributes", backfill_attrs, stock_parsed_raw, barcode_attrs)
@@ -769,7 +823,7 @@ with tab_overview:
 
 with tab_perf:
     st.markdown("#### ⏱️ Stage-by-Stage Runtime")
-    st.caption("Use this to see exactly where time is going on your real dataset. If one stage dominates, tell me which one and I'll optimize it further.")
+    st.caption("Use this to see exactly where time is going on your real dataset.")
     if timings:
         perf_df = pd.DataFrame(
             [{"stage": k, "seconds": round(v, 2)} for k, v in timings.items()]
