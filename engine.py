@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from datetime import date, timedelta
 from io import BytesIO
@@ -47,7 +48,11 @@ def detect_columns(columns: Iterable[str]) -> dict[str, str | None]:
 
 
 def csv_columns(payload: bytes) -> list[str]:
-    return pl.read_csv(BytesIO(payload), n_rows=0, encoding="utf8-lossy").columns
+    # Read only the physical header. Polars may otherwise infer an identifier as
+    # Int64 from early rows and fail before the mapping screen when a later
+    # barcode/store code contains letters.
+    first_line = payload.splitlines()[0].decode("utf-8-sig", errors="replace")
+    return next(csv.reader([first_line]))
 
 
 def validate_mapping(mapping: dict[str, str | None], required: Iterable[str], label: str) -> None:
@@ -58,8 +63,18 @@ def validate_mapping(mapping: dict[str, str | None], required: Iterable[str], la
 
 def _read_selected(payload: bytes, mapping: dict[str, str | None]) -> pl.DataFrame:
     selected = list(dict.fromkeys(v for v in mapping.values() if v))
+    identifier_fields = {
+        "store", "store_name", "cluster", "barcode", "style", "colour", "size",
+        "department", "subdepartment", "class", "subclass", "subbrand", "date",
+    }
+    schema_overrides = {
+        source: pl.Utf8
+        for field, source in mapping.items()
+        if field in identifier_fields and source in selected
+    }
     return pl.read_csv(
         BytesIO(payload), columns=selected, infer_schema_length=10_000,
+        schema_overrides=schema_overrides,
         ignore_errors=False, truncate_ragged_lines=False, encoding="utf8-lossy",
         null_values=["", "NULL", "null", "None", "nan"], low_memory=False,
     )

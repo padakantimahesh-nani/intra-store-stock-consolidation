@@ -33,4 +33,6 @@ py -m streamlit run app.py
 
 Polars performs multi-threaded CSV parsing and aggregation. Only the aggregated store-barcode position is converted to Pandas for the allocation loop and Streamlit display. Bad CSV rows are never silently discarded. Uploaded files and aggregations are cached, while stale results are blocked when files or rules change.
 
+Identifier columns—including barcode, store, cluster, style, colour and size—are forced to text. Mixed numeric/alphanumeric barcodes such as `12345678` and `JY11114015628` can therefore coexist safely.
+
 For the best speed, use UTF-8 CSV files with simple comma delimiters and avoid opening the same files in Excel while uploading them.
