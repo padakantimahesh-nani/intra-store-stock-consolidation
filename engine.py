@@ -97,18 +97,30 @@ def _canonicalize(df: pl.DataFrame, mapping: dict[str, str | None], fields: Iter
 
 
 def _clean_keys(df: pl.DataFrame) -> pl.DataFrame:
-    keys = [c for c in ["store", "cluster", "barcode", "style", "colour", "size"] if c in df.columns]
-    return df.with_columns([
-        pl.col(c).cast(pl.Utf8, strict=False).str.strip_chars().replace("", None).alias(c) for c in keys
-    ])
+    keys = [c for c in ["store", "cluster", "country", "store_brand", "barcode", "style", "colour", "size"] if c in df.columns]
+    expressions = []
+    for c in keys:
+        expr = pl.col(c).cast(pl.Utf8, strict=False).str.strip_chars().replace("", None)
+        if c in {"store", "cluster", "country", "barcode", "style", "colour", "size"}:
+            expr = expr.str.to_uppercase()
+        if c == "barcode":
+            expr = expr.str.replace(r"\.0$", "")
+        expressions.append(expr.alias(c))
+    return df.with_columns(expressions)
 
 
 def _cluster_from_file_or_country(df: pl.DataFrame) -> pl.DataFrame:
-    return df.with_columns(
+    out = df.with_columns(
         pl.coalesce([
             pl.col("cluster").cast(pl.Utf8, strict=False).str.strip_chars().replace("", None),
             pl.col("country").cast(pl.Utf8, strict=False).str.strip_chars().replace("", None),
         ]).alias("cluster")
+    )
+    return out.with_columns(
+        pl.col("cluster").str.to_uppercase()
+          .str.replace_all(r"\s+", " ")
+          .replace({"UAE": "UNITED ARAB EMIRATES", "U.A.E": "UNITED ARAB EMIRATES"})
+          .alias("cluster")
     )
 
 

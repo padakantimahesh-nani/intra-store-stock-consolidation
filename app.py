@@ -36,8 +36,9 @@ def cached_inventory(payload: bytes, mapping: dict):
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
-def cached_sales(payload: bytes, mapping: dict, as_of: date, days: int, apply_date_filter: bool):
-    return prepare_sales(payload, mapping, as_of, days, apply_date_filter)
+def cached_sales(payload: bytes, mapping: dict, as_of: date, days: int):
+    # The business input is already a fixed 30-day file. Use every uploaded row.
+    return prepare_sales(payload, mapping, as_of, days, False)
 
 
 def mapping_editor(label: str, columns: list[str], detected: dict, required: tuple[str, ...], optional: tuple[str, ...], prefix: str, expanded: bool):
@@ -67,10 +68,7 @@ with st.sidebar:
     st.header("Rules")
     as_of = st.date_input("Report date", value=date.today())
     window_days = st.number_input("Sales window (days)", 7, 90, 30)
-    filter_sales_dates = st.checkbox(
-        "Filter sales rows by report date", value=False,
-        help="Leave OFF when the sales upload already contains 30 days. Turn ON only for a longer date range.",
-    )
+    st.caption("All rows in the sales upload are used as the selected sales window.")
     safety_woc = st.slider("Safety WOC", 0.5, 8.0, 2.0, 0.5)
     target_woc = st.slider("Recipient target WOC", safety_woc, 12.0, max(4.0, safety_woc), 0.5)
     donor_max_woc = st.slider("Donor excess WOC", target_woc, 24.0, max(8.0, target_woc), 0.5)
@@ -114,7 +112,7 @@ if missing_inv or missing_sales:
 
 run = st.button("🚀 Calculate Consolidation", type="primary", use_container_width=True)
 signature = (inventory_file.file_id, sales_file.file_id, tuple(inv_mapping.items()), tuple(sales_mapping.items()),
-             as_of, window_days, filter_sales_dates, safety_woc, target_woc, donor_max_woc, zero_sale_keep,
+             as_of, window_days, safety_woc, target_woc, donor_max_woc, zero_sale_keep,
              min_transfer, max_sources, protect_curve, curve_min_sizes, cross_cluster)
 
 if run:
@@ -125,7 +123,7 @@ if run:
         with st.status("Running optimized consolidation…", expanded=True) as status:
             t0 = time.perf_counter(); inv, inv_quality = cached_inventory(inv_bytes, inv_mapping); t_inv = time.perf_counter()-t0
             st.write(f"Inventory aggregated: {inv.height:,} store–barcode records")
-            t0 = time.perf_counter(); sales, sales_quality = cached_sales(sales_bytes, sales_mapping, as_of, int(window_days), filter_sales_dates); t_sales = time.perf_counter()-t0
+            t0 = time.perf_counter(); sales, sales_quality = cached_sales(sales_bytes, sales_mapping, as_of, int(window_days)); t_sales = time.perf_counter()-t0
             st.write(f"Sales aggregated: {sales.height:,} store–barcode records")
             t0 = time.perf_counter(); position = build_position(inv, sales, rules); t_metrics = time.perf_counter()-t0
             t0 = time.perf_counter(); transfers, gaps, closing = recommend_transfers(position, rules); t_engine = time.perf_counter()-t0
@@ -157,7 +155,7 @@ k3.metric("Recommended Qty", f"{qty:,}"); k4.metric("Transfer Lines", f"{len(tra
 k5.metric("Unfulfilled Qty", f"{int(gaps.unfulfilled_qty.sum()) if not gaps.empty else 0:,}")
 k6.metric("Runtime", f"{result['runtime']:.1f}s")
 
-tabs = st.tabs(["Executive View", "Transfer Plan", "Store Summary", "Gaps", "SKU Position", "Data Quality & Speed"])
+tabs = st.tabs(["Executive View", "Transfer Plan", "Store Summary", "Gaps", "SKU Position", "Match Diagnostics", "Data Quality & Speed"])
 with tabs[0]:
     c1,c2 = st.columns(2)
     if not transfers.empty:
@@ -193,10 +191,38 @@ with tabs[4]:
     st.dataframe(closing[show+["transfer_in","transfer_out","closing_inventory","closing_woc"]],use_container_width=True,height=560)
     st.download_button("Download closing position",dataframe_csv(closing),"closing_inventory.csv","text/csv")
 with tabs[5]:
+    stock_rows = position[position["inventory_qty"] > 0]
+    sales_rows = position[position["sales_qty"] > 0]
+    donor_rows = closing[closing["donor_units"] > 0]
+    recipient_rows = closing[closing["need_units"] > 0]
+    stock_keys = set(zip(stock_rows["cluster"].astype(str), stock_rows["barcode"].astype(str)))
+    sales_keys = set(zip(sales_rows["cluster"].astype(str), sales_rows["barcode"].astype(str)))
+    donor_keys = set(zip(donor_rows["cluster"].astype(str), donor_rows["barcode"].astype(str)))
+    recipient_keys = set(zip(recipient_rows["cluster"].astype(str), recipient_rows["barcode"].astype(str)))
+    company_overlap = stock_keys & sales_keys
+    eligible_overlap = donor_keys & recipient_keys
+    d1,d2,d3,d4 = st.columns(4)
+    d1.metric("Stock barcode-country keys", f"{len(stock_keys):,}")
+    d2.metric("Sales barcode-country keys", f"{len(sales_keys):,}")
+    d3.metric("Stock/Sales overlap", f"{len(company_overlap):,}")
+    d4.metric("Eligible donor/recipient overlap", f"{len(eligible_overlap):,}")
+    if not eligible_overlap:
+        if not company_overlap:
+            st.error("No barcode has both stock and sales in the same country. Check whether the two exports cover the same assortment and period.")
+        else:
+            st.warning("Barcodes overlap, but none simultaneously has an eligible excess donor and a below-target recipient under the current WOC rules. Reduce Donor excess WOC or review the zero-sale keep quantity.")
+    else:
+        st.success(f"{len(eligible_overlap):,} barcode-country combinations are eligible for store-to-store matching.")
+    diag = pd.DataFrame({
+        "check": ["Stock/Sales barcode-country overlap", "Eligible donor/recipient overlap"],
+        "count": [len(company_overlap), len(eligible_overlap)],
+    })
+    st.dataframe(diag, use_container_width=True)
+with tabs[6]:
     st.subheader("Data quality")
     st.json({"inventory":result["inv_quality"],"sales":result["sales_quality"]})
     if not result["sales_quality"]["date_filter_applied"]:
-        st.info("Sales date filtering is OFF. The uploaded sales file is treated as the complete selected sales window.")
+        st.info("The uploaded sales file is treated as the complete selected sales window; no rows are removed by date parsing.")
     timing=pd.DataFrame([{"stage":k,"seconds":round(v,3)} for k,v in result["timings"].items()])
     st.dataframe(timing,use_container_width=True)
     st.caption("Invalid keys and negative inventory are excluded and counted; malformed CSV rows cause a visible error and are never silently skipped.")

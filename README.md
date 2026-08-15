@@ -11,6 +11,8 @@ Only two CSV files are required:
 
 These exact headings are auto-detected. Advanced mapping stays hidden unless a required heading is missing. Since the supplied files have no cluster field, `Country` is used as the default transfer cluster to prevent cross-country transfers.
 
+The sales upload is treated as the complete 30-day window. The application does not date-filter this fixed-period file, avoiding ambiguous day/month parsing. Barcode and country keys are uppercased and trimmed before matching, and a Match Diagnostics tab reports stock/sales overlap plus eligible donor/recipient overlap.
+
 ## Windows installation
 
 ```bat
