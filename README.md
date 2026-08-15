@@ -6,10 +6,10 @@ High-speed Streamlit application for moving barcode-level stock from slow-sellin
 
 Only two CSV files are required:
 
-1. `Inventory.csv`: store, cluster, barcode, inventory quantity. Style, colour, size, hierarchy, store name and age days are recommended.
-2. `30days sales.csv`: store, cluster, barcode, sales quantity. A date column is recommended; otherwise the file must already contain the chosen sales window.
+1. `Category Wise Stock - For Consolidation.csv`: `Location Code`, `Country`, `Item Barcode`, and `Available Qty` are the required stock fields.
+2. `Sale Data- with OFP Fields -Consol.csv`: `Code`, `Country`, `Item Barcode`, and `Net Sales Qty` are the required sales fields. Inventory quantity is never requested from this file.
 
-Column names are auto-detected and can be manually mapped in the interface.
+These exact headings are auto-detected. Advanced mapping stays hidden unless a required heading is missing. Since the supplied files have no cluster field, `Country` is used as the default transfer cluster to prevent cross-country transfers.
 
 ## Windows installation
 

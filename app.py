@@ -8,7 +8,7 @@ import plotly.express as px
 import streamlit as st
 
 from engine import (
-    ALIASES, REQUIRED_INVENTORY, REQUIRED_SALES, Rules, build_position, csv_columns,
+    INVENTORY_OPTIONAL, REQUIRED_INVENTORY, REQUIRED_SALES, SALES_OPTIONAL, Rules, build_position, csv_columns,
     dataframe_csv, detect_columns, prepare_inventory, prepare_sales, recommend_transfers,
 )
 
@@ -36,14 +36,14 @@ def cached_inventory(payload: bytes, mapping: dict):
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
-def cached_sales(payload: bytes, mapping: dict, as_of: date, days: int):
-    return prepare_sales(payload, mapping, as_of, days)
+def cached_sales(payload: bytes, mapping: dict, as_of: date, days: int, apply_date_filter: bool):
+    return prepare_sales(payload, mapping, as_of, days, apply_date_filter)
 
 
-def mapping_editor(label: str, columns: list[str], detected: dict, required: tuple[str, ...], prefix: str):
-    with st.expander(f"Column mapping — {label}", expanded=False):
+def mapping_editor(label: str, columns: list[str], detected: dict, required: tuple[str, ...], optional: tuple[str, ...], prefix: str, expanded: bool):
+    with st.expander(f"Advanced column mapping — {label}", expanded=expanded):
         result = dict(detected)
-        fields = list(dict.fromkeys([*required, *[x for x in ALIASES if x not in required]]))
+        fields = list(dict.fromkeys([*required, *optional]))
         left, right = st.columns(2)
         for i, field in enumerate(fields):
             target = left if i % 2 == 0 else right
@@ -62,11 +62,15 @@ st.caption("Fast barcode-level transfers from slow stores to high-opportunity st
 
 with st.sidebar:
     st.header("Files")
-    inventory_file = st.file_uploader("Inventory.csv", type=["csv"])
-    sales_file = st.file_uploader("30days sales.csv", type=["csv"])
+    inventory_file = st.file_uploader("Category Wise Stock - For Consolidation.csv", type=["csv"])
+    sales_file = st.file_uploader("Sale Data- with OFP Fields -Consol.csv", type=["csv"])
     st.header("Rules")
     as_of = st.date_input("Report date", value=date.today())
     window_days = st.number_input("Sales window (days)", 7, 90, 30)
+    filter_sales_dates = st.checkbox(
+        "Filter sales rows by report date", value=False,
+        help="Leave OFF when the sales upload already contains 30 days. Turn ON only for a longer date range.",
+    )
     safety_woc = st.slider("Safety WOC", 0.5, 8.0, 2.0, 0.5)
     target_woc = st.slider("Recipient target WOC", safety_woc, 12.0, max(4.0, safety_woc), 0.5)
     donor_max_woc = st.slider("Donor excess WOC", target_woc, 24.0, max(8.0, target_woc), 0.5)
@@ -88,8 +92,19 @@ except Exception as exc:
     st.error(f"CSV header could not be read: {exc}")
     st.stop()
 
-inv_mapping = mapping_editor("Inventory", inv_columns, detect_columns(inv_columns), REQUIRED_INVENTORY, "inv")
-sales_mapping = mapping_editor("Sales", sales_columns, detect_columns(sales_columns), REQUIRED_SALES, "sales")
+inv_detected, sales_detected = detect_columns(inv_columns), detect_columns(sales_columns)
+inv_auto_missing = [x for x in REQUIRED_INVENTORY if not inv_detected.get(x)]
+sales_auto_missing = [x for x in REQUIRED_SALES if not sales_detected.get(x)]
+show_mapping = st.checkbox(
+    "Show/override advanced column mapping", value=bool(inv_auto_missing or sales_auto_missing),
+    help="The supplied file formats are recognized automatically. Use this only after a heading changes.",
+)
+if show_mapping:
+    inv_mapping = mapping_editor("Inventory", inv_columns, inv_detected, REQUIRED_INVENTORY, INVENTORY_OPTIONAL, "inv", bool(inv_auto_missing))
+    sales_mapping = mapping_editor("Sales", sales_columns, sales_detected, REQUIRED_SALES, SALES_OPTIONAL, "sales", bool(sales_auto_missing))
+else:
+    inv_mapping, sales_mapping = inv_detected, sales_detected
+    st.success("Files recognized: Available Qty comes from stock; Net Sales Qty comes from sales.")
 
 missing_inv = [x for x in REQUIRED_INVENTORY if not inv_mapping.get(x)]
 missing_sales = [x for x in REQUIRED_SALES if not sales_mapping.get(x)]
@@ -99,7 +114,7 @@ if missing_inv or missing_sales:
 
 run = st.button("🚀 Calculate Consolidation", type="primary", use_container_width=True)
 signature = (inventory_file.file_id, sales_file.file_id, tuple(inv_mapping.items()), tuple(sales_mapping.items()),
-             as_of, window_days, safety_woc, target_woc, donor_max_woc, zero_sale_keep,
+             as_of, window_days, filter_sales_dates, safety_woc, target_woc, donor_max_woc, zero_sale_keep,
              min_transfer, max_sources, protect_curve, curve_min_sizes, cross_cluster)
 
 if run:
@@ -110,7 +125,7 @@ if run:
         with st.status("Running optimized consolidation…", expanded=True) as status:
             t0 = time.perf_counter(); inv, inv_quality = cached_inventory(inv_bytes, inv_mapping); t_inv = time.perf_counter()-t0
             st.write(f"Inventory aggregated: {inv.height:,} store–barcode records")
-            t0 = time.perf_counter(); sales, sales_quality = cached_sales(sales_bytes, sales_mapping, as_of, int(window_days)); t_sales = time.perf_counter()-t0
+            t0 = time.perf_counter(); sales, sales_quality = cached_sales(sales_bytes, sales_mapping, as_of, int(window_days), filter_sales_dates); t_sales = time.perf_counter()-t0
             st.write(f"Sales aggregated: {sales.height:,} store–barcode records")
             t0 = time.perf_counter(); position = build_position(inv, sales, rules); t_metrics = time.perf_counter()-t0
             t0 = time.perf_counter(); transfers, gaps, closing = recommend_transfers(position, rules); t_engine = time.perf_counter()-t0
@@ -181,7 +196,7 @@ with tabs[5]:
     st.subheader("Data quality")
     st.json({"inventory":result["inv_quality"],"sales":result["sales_quality"]})
     if not result["sales_quality"]["date_filter_applied"]:
-        st.warning("No sales date column was mapped. The app assumes the uploaded sales file already contains exactly the selected window.")
+        st.info("Sales date filtering is OFF. The uploaded sales file is treated as the complete selected sales window.")
     timing=pd.DataFrame([{"stage":k,"seconds":round(v,3)} for k,v in result["timings"].items()])
     st.dataframe(timing,use_container_width=True)
     st.caption("Invalid keys and negative inventory are excluded and counted; malformed CSV rows cause a visible error and are never silently skipped.")

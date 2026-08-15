@@ -15,6 +15,8 @@ ALIASES = {
     "store": ["store", "store code", "location code", "code", "store_code"],
     "store_name": ["store name", "location", "location name", "store_name"],
     "cluster": ["cluster", "store cluster", "store_cluster", "cluster name"],
+    "country": ["country"],
+    "store_brand": ["store brand", "store_brand", "brand format"],
     "barcode": ["barcode", "item barcode", "sku", "sku code", "item code"],
     "style": ["style", "item style code", "style code"],
     "colour": ["colour", "color", "item colour", "item color"],
@@ -30,9 +32,12 @@ ALIASES = {
     "age_days": ["age days", "ageing days", "aging days", "stock age days"],
 }
 
-REQUIRED_INVENTORY = ("store", "cluster", "barcode", "inventory_qty")
-REQUIRED_SALES = ("store", "cluster", "barcode", "sales_qty")
-ATTRS = ("store_name", "style", "colour", "size", "department", "subdepartment", "class", "subclass", "subbrand")
+REQUIRED_INVENTORY = ("store", "country", "barcode", "inventory_qty")
+REQUIRED_SALES = ("store", "country", "barcode", "sales_qty")
+PRODUCT_ATTRS = ("style", "colour", "size", "department", "subdepartment", "class", "subclass", "subbrand")
+ATTRS = ("store_name", "country", "store_brand", *PRODUCT_ATTRS)
+INVENTORY_OPTIONAL = ("cluster", "store_name", "store_brand", *PRODUCT_ATTRS, "age_days")
+SALES_OPTIONAL = ("cluster", "store_name", *PRODUCT_ATTRS, "date")
 
 
 def _norm(value: str) -> str:
@@ -65,7 +70,7 @@ def _read_selected(payload: bytes, mapping: dict[str, str | None]) -> pl.DataFra
     selected = list(dict.fromkeys(v for v in mapping.values() if v))
     identifier_fields = {
         "store", "store_name", "cluster", "barcode", "style", "colour", "size",
-        "department", "subdepartment", "class", "subclass", "subbrand", "date",
+        "country", "store_brand", "department", "subdepartment", "class", "subclass", "subbrand", "date",
     }
     schema_overrides = {
         source: pl.Utf8
@@ -98,11 +103,20 @@ def _clean_keys(df: pl.DataFrame) -> pl.DataFrame:
     ])
 
 
+def _cluster_from_file_or_country(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns(
+        pl.coalesce([
+            pl.col("cluster").cast(pl.Utf8, strict=False).str.strip_chars().replace("", None),
+            pl.col("country").cast(pl.Utf8, strict=False).str.strip_chars().replace("", None),
+        ]).alias("cluster")
+    )
+
+
 def prepare_inventory(payload: bytes, mapping: dict[str, str | None]) -> tuple[pl.DataFrame, dict]:
     validate_mapping(mapping, REQUIRED_INVENTORY, "Inventory.csv")
     raw = _read_selected(payload, mapping)
-    fields = (*REQUIRED_INVENTORY, *ATTRS, "age_days")
-    df = _clean_keys(_canonicalize(raw, mapping, fields)).with_columns(
+    fields = tuple(dict.fromkeys((*REQUIRED_INVENTORY, *INVENTORY_OPTIONAL)))
+    df = _cluster_from_file_or_country(_clean_keys(_canonicalize(raw, mapping, fields))).with_columns(
         pl.col("inventory_qty").cast(pl.Float64, strict=False).fill_null(0),
         pl.col("age_days").cast(pl.Float64, strict=False),
     )
@@ -124,16 +138,17 @@ def prepare_inventory(payload: bytes, mapping: dict[str, str | None]) -> tuple[p
 
 
 def prepare_sales(
-    payload: bytes, mapping: dict[str, str | None], as_of: date, window_days: int
+    payload: bytes, mapping: dict[str, str | None], as_of: date, window_days: int,
+    apply_date_filter: bool = False,
 ) -> tuple[pl.DataFrame, dict]:
     validate_mapping(mapping, REQUIRED_SALES, "30days sales.csv")
     raw = _read_selected(payload, mapping)
-    fields = (*REQUIRED_SALES, *ATTRS, "date")
-    df = _clean_keys(_canonicalize(raw, mapping, fields)).with_columns(
+    fields = tuple(dict.fromkeys((*REQUIRED_SALES, *SALES_OPTIONAL, "store_brand")))
+    df = _cluster_from_file_or_country(_clean_keys(_canonicalize(raw, mapping, fields))).with_columns(
         pl.col("sales_qty").cast(pl.Float64, strict=False).fill_null(0)
     )
     has_date = mapping.get("date") is not None
-    if has_date:
+    if has_date and apply_date_filter:
         parsed_date = pl.coalesce([
             pl.col("date").cast(pl.Utf8).str.strptime(pl.Date, format=fmt, strict=False)
             for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d-%b-%Y", "%m/%d/%Y"]
@@ -147,7 +162,7 @@ def prepare_sales(
         "missing_cluster": df["cluster"].null_count(),
         "missing_barcode": df["barcode"].null_count(),
         "negative_sales": df.filter(pl.col("sales_qty") < 0).height,
-        "date_filter_applied": has_date,
+        "date_filter_applied": has_date and apply_date_filter,
     }
     df = df.filter(
         pl.col("store").is_not_null() & pl.col("cluster").is_not_null() & pl.col("barcode").is_not_null()
